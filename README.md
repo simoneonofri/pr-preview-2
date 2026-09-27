@@ -157,6 +157,10 @@ The trusted publisher rejects payloads that:
 
 Stale builds are skipped if the PR HEAD has already changed.
 
+## Pages deployment identity
+
+Each Pages deployment uses the current `gh-pages` commit SHA as its Pages build version. This avoids stale deployments when multiple `workflow_run` executions share the same trusted workflow SHA.
+
 ## Concurrency
 
 PR builds are independent and may run concurrently.
