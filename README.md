@@ -86,9 +86,11 @@ Local SVG resolved from the diff:
 
 https://simoneonofri.github.io/digital-credentials/pr-preview/5/latest/diff/pr-preview-2-test.svg
 
-`static` is supported by the underlying implementation but has not yet been tested end-to-end.
+`static` is **experimental / untested** in PR Preview 2. The underlying `spec-prod` toolchain supports it, but it has not yet been exercised end-to-end here.
 
 ## Installation for testing
+
+For the first evaluation, use a fork or non-critical sandbox repository rather than a primary production repository. The trusted publisher intentionally requires write access to `gh-pages` and Pages deployment permissions.
 
 Two small caller workflows must live in the adopting repository.
 
