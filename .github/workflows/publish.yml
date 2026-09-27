@@ -274,12 +274,22 @@ jobs:
           echo "Unable to update gh-pages after retries" >&2
           exit 1
 
+      - name: Resolve stage-1 Pages build version
+        if: steps.trusted.outputs.mode == 'publish'
+        id: stage1_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C pages fetch origin gh-pages
+          echo "sha=$(git -C pages rev-parse origin/gh-pages)" >> "$GITHUB_OUTPUT"
+
       - name: Configure Pages
         if: steps.trusted.outputs.mode == 'publish' || steps.trusted.outputs.mode == 'cleanup'
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
 
       - name: Upload stage-1 site
         if: steps.trusted.outputs.mode == 'publish'
+        id: upload_stage1
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           name: pr-preview-2-stage1
@@ -289,9 +299,66 @@ jobs:
       - name: Deploy stage-1 site
         if: steps.trusted.outputs.mode == 'publish'
         id: deploy_stage1
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ARTIFACT_ID: ${{ steps.upload_stage1.outputs.artifact_id }}
+          BUILD_VERSION: ${{ steps.stage1_version.outputs.sha }}
         with:
-          artifact_name: pr-preview-2-stage1
+          script: |
+            const artifactId = Number(process.env.ARTIFACT_ID);
+            const buildVersion = process.env.BUILD_VERSION;
+            if (!Number.isInteger(artifactId) || artifactId <= 0) {
+              core.setFailed("Invalid Pages artifact ID");
+              return;
+            }
+            if (!/^[0-9a-f]{40}$/.test(buildVersion || "")) {
+              core.setFailed("Invalid Pages build version");
+              return;
+            }
+
+            const idToken = await core.getIDToken();
+            const { owner, repo } = context.repo;
+            const { data: deployment } = await github.request(
+              "POST /repos/{owner}/{repo}/pages/deployments",
+              {
+                owner,
+                repo,
+                artifact_id: artifactId,
+                pages_build_version: buildVersion,
+                oidc_token: idToken,
+              },
+            );
+
+            const deploymentId =
+              deployment.id ||
+              deployment.status_url?.split("/").pop() ||
+              buildVersion;
+            core.setOutput("page_url", deployment.page_url || "");
+
+            const terminalFailures = new Set([
+              "deployment_failed",
+              "deployment_content_failed",
+              "deployment_cancelled",
+              "deployment_lost",
+            ]);
+
+            for (let attempt = 0; attempt < 120; attempt++) {
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              const { data: status } = await github.request(
+                "GET /repos/{owner}/{repo}/pages/deployments/{deploymentId}",
+                { owner, repo, deploymentId },
+              );
+              if (status.status === "succeed") {
+                core.info(`Pages deployment ${deploymentId} succeeded for ${buildVersion}`);
+                return;
+              }
+              if (terminalFailures.has(status.status)) {
+                core.setFailed(`Pages deployment failed: ${status.status}`);
+                return;
+              }
+            }
+
+            core.setFailed("Timed out waiting for Pages deployment");
 
       - name: Wait for published BASE and HEAD
         if: steps.trusted.outputs.mode == 'publish'
@@ -424,14 +491,17 @@ jobs:
 
       - name: Refresh archive after optional diff
         if: steps.trusted.outputs.mode == 'publish'
+        id: final_version
         shell: bash
         run: |
           set -euo pipefail
           git -C pages fetch origin gh-pages
           git -C pages reset --hard origin/gh-pages
+          echo "sha=$(git -C pages rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Upload final site
         if: steps.trusted.outputs.mode == 'publish'
+        id: upload_final
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           name: pr-preview-2-final
@@ -441,9 +511,66 @@ jobs:
       - name: Deploy final site
         if: steps.trusted.outputs.mode == 'publish'
         id: deploy_final
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ARTIFACT_ID: ${{ steps.upload_final.outputs.artifact_id }}
+          BUILD_VERSION: ${{ steps.final_version.outputs.sha }}
         with:
-          artifact_name: pr-preview-2-final
+          script: |
+            const artifactId = Number(process.env.ARTIFACT_ID);
+            const buildVersion = process.env.BUILD_VERSION;
+            if (!Number.isInteger(artifactId) || artifactId <= 0) {
+              core.setFailed("Invalid Pages artifact ID");
+              return;
+            }
+            if (!/^[0-9a-f]{40}$/.test(buildVersion || "")) {
+              core.setFailed("Invalid Pages build version");
+              return;
+            }
+
+            const idToken = await core.getIDToken();
+            const { owner, repo } = context.repo;
+            const { data: deployment } = await github.request(
+              "POST /repos/{owner}/{repo}/pages/deployments",
+              {
+                owner,
+                repo,
+                artifact_id: artifactId,
+                pages_build_version: buildVersion,
+                oidc_token: idToken,
+              },
+            );
+
+            const deploymentId =
+              deployment.id ||
+              deployment.status_url?.split("/").pop() ||
+              buildVersion;
+            core.setOutput("page_url", deployment.page_url || "");
+
+            const terminalFailures = new Set([
+              "deployment_failed",
+              "deployment_content_failed",
+              "deployment_cancelled",
+              "deployment_lost",
+            ]);
+
+            for (let attempt = 0; attempt < 120; attempt++) {
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              const { data: status } = await github.request(
+                "GET /repos/{owner}/{repo}/pages/deployments/{deploymentId}",
+                { owner, repo, deploymentId },
+              );
+              if (status.status === "succeed") {
+                core.info(`Pages deployment ${deploymentId} succeeded for ${buildVersion}`);
+                return;
+              }
+              if (terminalFailures.has(status.status)) {
+                core.setFailed(`Pages deployment failed: ${status.status}`);
+                return;
+              }
+            }
+
+            core.setFailed("Timed out waiting for Pages deployment");
 
       - name: Verify published snapshot
         if: steps.trusted.outputs.mode == 'publish'
@@ -567,14 +694,17 @@ jobs:
 
       - name: Refresh cleaned archive
         if: steps.trusted.outputs.mode == 'cleanup'
+        id: cleanup_version
         shell: bash
         run: |
           set -euo pipefail
           git -C pages fetch origin gh-pages
           git -C pages reset --hard origin/gh-pages
+          echo "sha=$(git -C pages rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Upload cleaned site
         if: steps.trusted.outputs.mode == 'cleanup'
+        id: upload_cleanup
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           name: pr-preview-2-cleanup
@@ -584,6 +714,63 @@ jobs:
       - name: Deploy cleaned site
         if: steps.trusted.outputs.mode == 'cleanup'
         id: deploy_cleanup
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ARTIFACT_ID: ${{ steps.upload_cleanup.outputs.artifact_id }}
+          BUILD_VERSION: ${{ steps.cleanup_version.outputs.sha }}
         with:
-          artifact_name: pr-preview-2-cleanup
+          script: |
+            const artifactId = Number(process.env.ARTIFACT_ID);
+            const buildVersion = process.env.BUILD_VERSION;
+            if (!Number.isInteger(artifactId) || artifactId <= 0) {
+              core.setFailed("Invalid Pages artifact ID");
+              return;
+            }
+            if (!/^[0-9a-f]{40}$/.test(buildVersion || "")) {
+              core.setFailed("Invalid Pages build version");
+              return;
+            }
+
+            const idToken = await core.getIDToken();
+            const { owner, repo } = context.repo;
+            const { data: deployment } = await github.request(
+              "POST /repos/{owner}/{repo}/pages/deployments",
+              {
+                owner,
+                repo,
+                artifact_id: artifactId,
+                pages_build_version: buildVersion,
+                oidc_token: idToken,
+              },
+            );
+
+            const deploymentId =
+              deployment.id ||
+              deployment.status_url?.split("/").pop() ||
+              buildVersion;
+            core.setOutput("page_url", deployment.page_url || "");
+
+            const terminalFailures = new Set([
+              "deployment_failed",
+              "deployment_content_failed",
+              "deployment_cancelled",
+              "deployment_lost",
+            ]);
+
+            for (let attempt = 0; attempt < 120; attempt++) {
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              const { data: status } = await github.request(
+                "GET /repos/{owner}/{repo}/pages/deployments/{deploymentId}",
+                { owner, repo, deploymentId },
+              );
+              if (status.status === "succeed") {
+                core.info(`Pages deployment ${deploymentId} succeeded for ${buildVersion}`);
+                return;
+              }
+              if (terminalFailures.has(status.status)) {
+                core.setFailed(`Pages deployment failed: ${status.status}`);
+                return;
+              }
+            }
+
+            core.setFailed("Timed out waiting for Pages deployment");
