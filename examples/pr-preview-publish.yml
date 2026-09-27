@@ -1,0 +1,17 @@
+name: PR Preview 2 Publish
+
+on:
+  workflow_run:
+    workflows: ["PR Preview 2 Build"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+  pages: write
+  id-token: write
+
+jobs:
+  publish:
+    uses: simoneonofri/pr-preview-2/.github/workflows/publish.yml@main
