@@ -1,0 +1,203 @@
+name: PR Preview 2 Build
+
+on:
+  workflow_call:
+    inputs:
+      toolchain:
+        description: "spec-prod toolchain: bikeshed, respec, or static"
+        required: true
+        type: string
+      source:
+        description: "Specification source path, e.g. index.bs or index.html"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-preview-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Resolve PR revisions
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    outputs:
+      merge_base: ${{ steps.refs.outputs.merge_base }}
+      head_sha: ${{ steps.refs.outputs.head_sha }}
+      head_repo: ${{ steps.refs.outputs.head_repo }}
+      base_sha: ${{ steps.refs.outputs.base_sha }}
+    steps:
+      - name: Validate caller event
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ github.event_name }}" = "pull_request"
+
+      - name: Checkout base repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      - name: Resolve exact HEAD and merge-base
+        id: refs
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+
+          git remote add pr-head "https://github.com/${HEAD_REPO}.git"
+          git fetch --no-tags pr-head "$HEAD_SHA"
+          MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          [[ "$MERGE_BASE" =~ ^[0-9a-f]{40}$ ]]
+
+          echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_repo=$HEAD_REPO" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+  build-base:
+    name: Build BASE with spec-prod
+    if: github.event.action != 'closed'
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout merge-base from base repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.resolve.outputs.merge_base }}
+
+      - name: Build BASE
+        uses: w3c/spec-prod@f5550462411c95d96d7f2bc920b3c4c85d9ad50c # v2
+        with:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+          SOURCE: ${{ inputs.source }}
+          ARTIFACT_NAME: pr-preview-2-base
+          BUILD_FAIL_ON: nothing
+          VALIDATE_MARKUP: "false"
+          VALIDATE_WEBIDL: "false"
+          VALIDATE_LINKS: "false"
+          VALIDATE_PUBRULES: "false"
+
+  build-head:
+    name: Build HEAD with spec-prod
+    if: github.event.action != 'closed'
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact PR HEAD
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.resolve.outputs.head_repo }}
+          ref: ${{ needs.resolve.outputs.head_sha }}
+
+      - name: Build HEAD
+        uses: w3c/spec-prod@f5550462411c95d96d7f2bc920b3c4c85d9ad50c # v2
+        with:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+          SOURCE: ${{ inputs.source }}
+          ARTIFACT_NAME: pr-preview-2-head
+          BUILD_FAIL_ON: nothing
+          VALIDATE_MARKUP: "false"
+          VALIDATE_WEBIDL: "false"
+          VALIDATE_LINKS: "false"
+          VALIDATE_PUBRULES: "false"
+
+  package:
+    name: Package untrusted preview payload
+    if: github.event.action != 'closed'
+    needs:
+      - resolve
+      - build-base
+      - build-head
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-preview-2-base
+          path: payload/base
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-preview-2-head
+          path: payload/head
+
+      - name: Create manifest
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+          BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
+          MERGE_BASE: ${{ needs.resolve.outputs.merge_base }}
+          HEAD_REPO: ${{ needs.resolve.outputs.head_repo }}
+          BASE_REPO: ${{ github.repository }}
+          TOOLCHAIN: ${{ inputs.toolchain }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MERGE_BASE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TOOLCHAIN" =~ ^(bikeshed|respec|static)$ ]]
+          test -n "$SOURCE"
+          test -f payload/base/index.html
+          test -f payload/head/index.html
+
+          python3 - <<'PY'
+          import json, os
+          data = {
+              "schema": "pr-preview-2-payload-v1",
+              "repository": os.environ["BASE_REPO"],
+              "pr_number": int(os.environ["PR_NUMBER"]),
+              "head_repository": os.environ["HEAD_REPO"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "base_sha": os.environ["BASE_SHA"],
+              "merge_base": os.environ["MERGE_BASE"],
+              "toolchain": os.environ["TOOLCHAIN"],
+              "source": os.environ["SOURCE"],
+          }
+          with open("payload/manifest.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, sort_keys=True)
+          PY
+
+      - name: Upload bounded payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-preview-2-payload
+          path: payload
+          retention-days: 2
+          if-no-files-found: error
+
+  package-close:
+    name: Package close signal
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate close event
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          test "${{ github.event_name }}" = "pull_request"
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
