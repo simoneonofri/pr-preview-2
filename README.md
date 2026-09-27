@@ -52,6 +52,8 @@ The publisher runs from the default branch, never checks out the PR HEAD, re-que
 
 End-to-end tests have been completed on repositories owned by `simoneonofri` only.
 
+The packaged release **`v0.1.0-alpha.2`** has been re-tested end-to-end on both Bikeshed and ReSpec. In both repositories, the build and trusted publisher were confirmed to reference the same immutable `pr-preview-2@v0.1.0-alpha.2` tag.
+
 ### Bikeshed
 
 Tested on `simoneonofri/threat-modeling-guide`:
@@ -59,18 +61,48 @@ Tested on `simoneonofri/threat-modeling-guide`:
 - BASE / HEAD builds
 - local assets
 - W3C HTML Diff
+- assets resolved inside the diff
 - multiple immutable snapshots
 - `latest`
 - concurrent PR publishers
 - merged cleanup
 - closed-unmerged cleanup
 - preservation of the existing Pages root
+- repeated Pages deployments using unique `gh-pages` build versions
+
+Live packaged test PR:
+
+https://github.com/simoneonofri/threat-modeling-guide/pull/4
+
+Live preview:
+
+https://simoneonofri.github.io/threat-modeling-guide/pr-preview/4/latest/head/index.html
+
+Live diff:
+
+https://simoneonofri.github.io/threat-modeling-guide/pr-preview/4/latest/diff/index.html
+
+Local SVG resolved from the diff:
+
+https://simoneonofri.github.io/threat-modeling-guide/pr-preview/4/latest/diff/pr-preview-2-packaged-test.svg
+
+A fresh closed-unmerged cleanup check was also run with packaged `alpha.2`; the temporary preview directory was removed while the live PR #4 preview and the existing Pages root remained unchanged.
 
 ### ReSpec
 
-Tested on `simoneonofri/digital-credentials`.
+Tested on `simoneonofri/digital-credentials`:
 
-Live test PR:
+- BASE / HEAD builds
+- local assets discovered and copied by `spec-prod`
+- W3C HTML Diff
+- assets resolved inside the diff
+- multiple immutable snapshots
+- `latest`
+- closed-unmerged cleanup
+- preservation of the existing Pages root
+- repeated Pages deployments using unique `gh-pages` build versions
+
+Live packaged test PR:
 
 https://github.com/simoneonofri/digital-credentials/pull/5
 
@@ -85,6 +117,8 @@ https://simoneonofri.github.io/digital-credentials/pr-preview/5/latest/diff/inde
 Local SVG resolved from the diff:
 
 https://simoneonofri.github.io/digital-credentials/pr-preview/5/latest/diff/pr-preview-2-test.svg
+
+A fresh closed-unmerged cleanup check was also run with packaged `alpha.2`; the temporary preview directory was removed while the live PR #5 preview and the existing Pages root remained unchanged.
 
 `static` is **experimental / untested** in PR Preview 2. The underlying `spec-prod` toolchain supports it, but it has not yet been exercised end-to-end here.
 
