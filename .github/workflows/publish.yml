@@ -1,0 +1,589 @@
+name: PR Preview 2 Publish
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pr-preview-pages-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Trusted preview publisher
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy_final.outputs.page_url || steps.deploy_cleanup.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+    steps:
+      - name: Resolve trusted PR state
+        id: trusted
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "${{ github.event_name }}" = "workflow_run"
+
+          RUN_JSON="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")"
+          PR_NUMBER="$(jq -r '.pull_requests[0].number // empty' <<<"$RUN_JSON")"
+          RUN_HEAD_SHA="$(jq -r '.head_sha // empty' <<<"$RUN_JSON")"
+          RUN_HEAD_BRANCH="$(jq -r '.head_branch // empty' <<<"$RUN_JSON")"
+          RUN_HEAD_REPO="$(jq -r '.head_repository.full_name // empty' <<<"$RUN_JSON")"
+
+          [[ "$RUN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            PRS_JSON="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls")"
+            PR_NUMBER="$(jq -r --arg repo "$GITHUB_REPOSITORY" --arg sha "$RUN_HEAD_SHA"               '[.[] | select(.base.repo.full_name == $repo and .head.sha == $sha)] | sort_by(.number) | last | .number // empty'               <<<"$PRS_JSON")"
+          fi
+
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            [[ "$RUN_HEAD_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+            test -n "$RUN_HEAD_BRANCH"
+            RUN_HEAD_OWNER="${RUN_HEAD_REPO%%/*}"
+            PRS_JSON="$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls"               -f state=closed               -f head="$RUN_HEAD_OWNER:$RUN_HEAD_BRANCH"               -f per_page=100)"
+            PR_NUMBER="$(jq -r --arg repo "$GITHUB_REPOSITORY" --arg sha "$RUN_HEAD_SHA"               '[.[] | select(.base.repo.full_name == $repo and .head.sha == $sha)] | sort_by(.number) | last | .number // empty'               <<<"$PRS_JSON")"
+          fi
+
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          STATE="$(jq -r '.state' <<<"$PR_JSON")"
+          HEAD_SHA="$(jq -r '.head.sha' <<<"$PR_JSON")"
+          BASE_SHA="$(jq -r '.base.sha' <<<"$PR_JSON")"
+          HEAD_REPO="$(jq -r '.head.repo.full_name' <<<"$PR_JSON")"
+
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+
+          MODE=publish
+          if [ "$STATE" = "closed" ]; then
+            MODE=cleanup
+          elif [ "$RUN_CONCLUSION" != "success" ]; then
+            MODE=skip
+          elif [ "$RUN_HEAD_SHA" != "$HEAD_SHA" ]; then
+            MODE=skip
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_repo=$HEAD_REPO" >> "$GITHUB_OUTPUT"
+
+          echo "Trusted state: PR #$PR_NUMBER state=$STATE mode=$MODE"
+
+      - name: Download untrusted build artifact
+        if: steps.trusted.outputs.mode == 'publish'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-preview-2-payload
+          path: payload
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Validate untrusted payload as data
+        if: steps.trusted.outputs.mode == 'publish'
+        id: validate
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.trusted.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.trusted.outputs.head_sha }}
+          BASE_SHA: ${{ steps.trusted.outputs.base_sha }}
+          HEAD_REPO: ${{ steps.trusted.outputs.head_repo }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          python3 - <<'PY'
+          import json, os, pathlib, stat
+
+          root = pathlib.Path("payload")
+          manifest_path = root / "manifest.json"
+          if not manifest_path.is_file():
+              raise SystemExit("missing manifest.json")
+
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected = {
+              "schema": "pr-preview-2-payload-v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "pr_number": int(os.environ["PR_NUMBER"]),
+              "head_repository": os.environ["HEAD_REPO"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "base_sha": os.environ["BASE_SHA"],
+          }
+          for key, value in expected.items():
+              if manifest.get(key) != value:
+                  raise SystemExit(f"manifest mismatch for {key}")
+
+          merge_base = manifest.get("merge_base", "")
+          if len(merge_base) != 40 or any(c not in "0123456789abcdef" for c in merge_base):
+              raise SystemExit("invalid merge_base")
+
+          toolchain = manifest.get("toolchain", "")
+          if toolchain not in {"bikeshed", "respec", "static"}:
+              raise SystemExit("invalid toolchain")
+
+          source = manifest.get("source", "")
+          if not isinstance(source, str) or not source or source.startswith("/") or ".." in pathlib.PurePosixPath(source).parts:
+              raise SystemExit("invalid source path")
+
+          allowed_top = {"manifest.json", "base", "head"}
+          actual_top = {p.name for p in root.iterdir()}
+          if actual_top != allowed_top:
+              raise SystemExit(f"unexpected payload top-level entries: {sorted(actual_top)}")
+
+          file_count = 0
+          total_bytes = 0
+          root_resolved = root.resolve()
+
+          for p in root.rglob("*"):
+              resolved = p.resolve()
+              if root_resolved not in resolved.parents and resolved != root_resolved:
+                  raise SystemExit(f"path escapes payload: {p}")
+              if p.is_symlink():
+                  raise SystemExit(f"symlink rejected: {p}")
+              mode = p.lstat().st_mode
+              if p.is_dir():
+                  continue
+              if not stat.S_ISREG(mode):
+                  raise SystemExit(f"special file rejected: {p}")
+              file_count += 1
+              total_bytes += p.stat().st_size
+
+          if file_count > 5000:
+              raise SystemExit(f"too many files: {file_count}")
+          if total_bytes > 50 * 1024 * 1024:
+              raise SystemExit(f"payload too large: {total_bytes}")
+          if not (root / "base" / "index.html").is_file():
+              raise SystemExit("missing base/index.html")
+          if not (root / "head" / "index.html").is_file():
+              raise SystemExit("missing head/index.html")
+
+          print(f"Validated {file_count} regular files, {total_bytes} bytes")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              print(f"merge_base={merge_base}", file=out)
+          PY
+
+      - name: Checkout current persistent Pages archive
+        if: steps.trusted.outputs.mode == 'publish' || steps.trusted.outputs.mode == 'cleanup'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: gh-pages
+          path: pages
+          fetch-depth: 0
+
+      - name: Configure archive identity
+        if: steps.trusted.outputs.mode == 'publish' || steps.trusted.outputs.mode == 'cleanup'
+        shell: bash
+        run: |
+          git -C pages config user.name "github-actions[bot]"
+          git -C pages config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Assemble immutable snapshot and latest
+        if: steps.trusted.outputs.mode == 'publish'
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.trusted.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.trusted.outputs.head_sha }}
+          MERGE_BASE: ${{ steps.validate.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MERGE_BASE" =~ ^[0-9a-f]{40}$ ]]
+
+          PREFIX="pr-preview/$PR_NUMBER"
+          SNAPSHOT="$PREFIX/$HEAD_SHA"
+
+          rm -rf "pages/$SNAPSHOT"
+          mkdir -p "pages/$SNAPSHOT/base" "pages/$SNAPSHOT/head"
+          cp -a payload/base/. "pages/$SNAPSHOT/base/"
+          cp -a payload/head/. "pages/$SNAPSHOT/head/"
+
+          cat > "pages/$SNAPSHOT/index.html" <<EOF
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>PR #$PR_NUMBER preview</title>
+          <h1>PR #$PR_NUMBER</h1>
+          <p>Merge-base: <code>$MERGE_BASE</code></p>
+          <p>HEAD: <code>$HEAD_SHA</code></p>
+          <ul>
+            <li><a href="./base/index.html">BASE</a></li>
+            <li><a href="./head/index.html">HEAD</a></li>
+          </ul>
+          EOF
+
+          rm -rf "pages/$PREFIX/latest"
+          cp -a "pages/$SNAPSHOT" "pages/$PREFIX/latest"
+
+          git -C pages add -- "$PREFIX"
+          CHANGED="$(git -C pages diff --cached --name-only)"
+          if [ -n "$CHANGED" ] && grep -Ev "^pr-preview/$PR_NUMBER/" <<<"$CHANGED" >/dev/null; then
+            echo "Refusing staged path outside pr-preview/$PR_NUMBER/" >&2
+            exit 1
+          fi
+
+          if ! git -C pages diff --cached --quiet; then
+            git -C pages commit -m "Preview PR #$PR_NUMBER at ${HEAD_SHA:0:12}"
+          fi
+
+      - name: Push archive update with retry
+        if: steps.trusted.outputs.mode == 'publish'
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.trusted.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          verify_scope() {
+            CHANGED="$(git -C pages diff-tree --no-commit-id --name-only -r HEAD)"
+            if [ -n "$CHANGED" ] && grep -Ev "^pr-preview/$PR_NUMBER/" <<<"$CHANGED" >/dev/null; then
+              echo "Commit scope violation" >&2
+              exit 1
+            fi
+          }
+
+          verify_scope
+
+          for attempt in 1 2 3; do
+            if git -C pages push origin HEAD:gh-pages; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; rebasing on current gh-pages"
+            git -C pages fetch origin gh-pages
+            git -C pages rebase origin/gh-pages
+            verify_scope
+          done
+
+          echo "Unable to update gh-pages after retries" >&2
+          exit 1
+
+      - name: Configure Pages
+        if: steps.trusted.outputs.mode == 'publish' || steps.trusted.outputs.mode == 'cleanup'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+
+      - name: Upload stage-1 site
+        if: steps.trusted.outputs.mode == 'publish'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          name: pr-preview-2-stage1
+          path: pages
+          retention-days: 1
+
+      - name: Deploy stage-1 site
+        if: steps.trusted.outputs.mode == 'publish'
+        id: deploy_stage1
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+        with:
+          artifact_name: pr-preview-2-stage1
+
+      - name: Wait for published BASE and HEAD
+        if: steps.trusted.outputs.mode == 'publish'
+        id: urls
+        shell: bash
+        env:
+          PAGE_URL: ${{ steps.deploy_stage1.outputs.page_url }}
+          PR_NUMBER: ${{ steps.trusted.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.trusted.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          SNAPSHOT_URL="${PAGE_URL%/}/pr-preview/$PR_NUMBER/$HEAD_SHA/"
+          LATEST_URL="${PAGE_URL%/}/pr-preview/$PR_NUMBER/latest/"
+
+          wait_url() {
+            url="$1"
+            for attempt in {1..30}; do
+              if curl --fail --silent --show-error --location "$url" -o /dev/null; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "Timed out waiting for $url" >&2
+            return 1
+          }
+
+          wait_url "${SNAPSHOT_URL%/}/base/index.html"
+          wait_url "${SNAPSHOT_URL%/}/head/index.html"
+
+          echo "snapshot_url=$SNAPSHOT_URL" >> "$GITHUB_OUTPUT"
+          echo "latest_url=$LATEST_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Generate W3C HTML Diff
+        if: steps.trusted.outputs.mode == 'publish'
+        id: diff
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.trusted.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.trusted.outputs.head_sha }}
+          SNAPSHOT_URL: ${{ steps.urls.outputs.snapshot_url }}
+        run: |
+          set -euo pipefail
+
+          PREFIX="pr-preview/$PR_NUMBER"
+          SNAPSHOT="$PREFIX/$HEAD_SHA"
+          BASE_URL="${SNAPSHOT_URL%/}/base/index.html"
+          HEAD_URL="${SNAPSHOT_URL%/}/head/index.html"
+
+          DIFF_URL="$(python3 - "$BASE_URL" "$HEAD_URL" <<'PY'
+          import sys, urllib.parse
+          base, head = sys.argv[1:3]
+          print("https://services.w3.org/htmldiff?" + urllib.parse.urlencode({
+              "doc1": base,
+              "doc2": head,
+          }))
+          PY
+          )"
+
+          mkdir -p "pages/$SNAPSHOT/diff"
+          curl --fail --show-error --location --retry 3 --max-time 90             "$DIFF_URL" -o "pages/$SNAPSHOT/diff/index.html"
+          test -s "pages/$SNAPSHOT/diff/index.html"
+
+          # HTML Diff keeps relative URLs from the compared documents.
+          # Mirror BASE assets and then HEAD assets into diff/, preserving paths.
+          # HEAD wins on conflicts. The generated diff index.html is never replaced.
+          python3 - "pages/$SNAPSHOT/base" "pages/$SNAPSHOT/head" "pages/$SNAPSHOT/diff" <<'PY'
+          from pathlib import Path
+          import shutil, sys
+
+          base, head, dest = map(Path, sys.argv[1:4])
+          for source in (base, head):
+              for src in source.rglob("*"):
+                  if not src.is_file():
+                      continue
+                  rel = src.relative_to(source)
+                  if rel.as_posix() == "index.html":
+                      continue
+                  target = dest / rel
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, target)
+          PY
+
+          python3 - "pages/$SNAPSHOT/index.html" <<'PY'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          s = p.read_text()
+          if "./diff/index.html" not in s:
+              s = s.replace("</ul>", '  <li><a href="./diff/index.html">DIFF</a></li>\n</ul>')
+          p.write_text(s)
+          PY
+
+          rm -rf "pages/$PREFIX/latest"
+          cp -a "pages/$SNAPSHOT" "pages/$PREFIX/latest"
+
+          git -C pages add -- "$PREFIX"
+          CHANGED="$(git -C pages diff --cached --name-only)"
+          if [ -n "$CHANGED" ] && grep -Ev "^pr-preview/$PR_NUMBER/" <<<"$CHANGED" >/dev/null; then
+            echo "Refusing staged path outside pr-preview/$PR_NUMBER/" >&2
+            exit 1
+          fi
+
+          if ! git -C pages diff --cached --quiet; then
+            git -C pages commit -m "Add diff for PR #$PR_NUMBER at ${HEAD_SHA:0:12}"
+
+            pushed=0
+            for attempt in 1 2 3; do
+              if git -C pages push origin HEAD:gh-pages; then
+                pushed=1
+                break
+              fi
+
+              echo "Diff push attempt $attempt failed; rebasing on current gh-pages"
+              git -C pages fetch origin gh-pages
+              git -C pages rebase origin/gh-pages
+
+              CHANGED="$(git -C pages diff-tree --no-commit-id --name-only -r HEAD)"
+              if [ -n "$CHANGED" ] && grep -Ev "^pr-preview/$PR_NUMBER/" <<<"$CHANGED" >/dev/null; then
+                echo "Diff commit scope violation after rebase" >&2
+                exit 1
+              fi
+            done
+
+            test "$pushed" = 1
+          fi
+
+      - name: Refresh archive after optional diff
+        if: steps.trusted.outputs.mode == 'publish'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C pages fetch origin gh-pages
+          git -C pages reset --hard origin/gh-pages
+
+      - name: Upload final site
+        if: steps.trusted.outputs.mode == 'publish'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          name: pr-preview-2-final
+          path: pages
+          retention-days: 1
+
+      - name: Deploy final site
+        if: steps.trusted.outputs.mode == 'publish'
+        id: deploy_final
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+        with:
+          artifact_name: pr-preview-2-final
+
+      - name: Verify published snapshot
+        if: steps.trusted.outputs.mode == 'publish'
+        shell: bash
+        env:
+          PAGE_URL: ${{ steps.deploy_final.outputs.page_url }}
+          PR_NUMBER: ${{ steps.trusted.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.trusted.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          SNAPSHOT_URL="${PAGE_URL%/}/pr-preview/$PR_NUMBER/$HEAD_SHA/"
+          LATEST_URL="${PAGE_URL%/}/pr-preview/$PR_NUMBER/latest/"
+
+          wait_url() {
+            url="$1"
+            for attempt in {1..30}; do
+              if curl --fail --silent --show-error --location "$url" -o /dev/null; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "Timed out waiting for $url" >&2
+            return 1
+          }
+
+          for base in "$SNAPSHOT_URL" "$LATEST_URL"; do
+            for path in "" base/index.html head/index.html; do
+              wait_url "${base%/}/$path"
+            done
+          done
+
+          if [ "${{ steps.diff.outcome }}" = "success" ]; then
+            wait_url "${LATEST_URL%/}/diff/index.html"
+          fi
+
+      - name: Create or update PR Preview 2 comment
+        if: steps.trusted.outputs.mode == 'publish'
+        shell: bash
+        env:
+          PAGE_URL: ${{ steps.deploy_final.outputs.page_url }}
+          PR_NUMBER: ${{ steps.trusted.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.trusted.outputs.head_sha }}
+          MERGE_BASE: ${{ steps.validate.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+
+          LATEST_URL="${PAGE_URL%/}/pr-preview/$PR_NUMBER/latest"
+          SNAPSHOT_URL="${PAGE_URL%/}/pr-preview/$PR_NUMBER/$HEAD_SHA"
+          MARKER="<!-- pr-preview-2 -->"
+
+          DIFF_LINE=""
+          if [ "${{ steps.diff.outcome }}" = "success" ]; then
+            DIFF_LINE="- [Diff]($LATEST_URL/diff/index.html)"
+          fi
+
+          BODY="$MARKER
+          **PR Preview 2**
+
+          - [Preview]($LATEST_URL/head/index.html)
+          $DIFF_LINE
+          - [BASE]($LATEST_URL/base/index.html)
+          - [Immutable snapshot]($SNAPSHOT_URL/)
+
+          HEAD: \`$HEAD_SHA\`
+          Merge-base: \`$MERGE_BASE\`"
+
+          COMMENT_ID="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- pr-preview-2 -->"))) | .id'             | tail -n 1)"
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID"               -f body="$BODY" >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"               -f body="$BODY" >/dev/null
+          fi
+
+      - name: Remove closed PR preview
+        if: steps.trusted.outputs.mode == 'cleanup'
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.trusted.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+
+          PREFIX="pr-preview/$PR_NUMBER"
+
+          if [ ! -d "pages/$PREFIX" ]; then
+            echo "Preview already absent."
+            exit 0
+          fi
+
+          rm -rf "pages/$PREFIX"
+          git -C pages add -A -- "$PREFIX"
+
+          CHANGED="$(git -C pages diff --cached --name-only)"
+          if [ -n "$CHANGED" ] && grep -Ev "^pr-preview/$PR_NUMBER/" <<<"$CHANGED" >/dev/null; then
+            echo "Refusing cleanup outside pr-preview/$PR_NUMBER/" >&2
+            exit 1
+          fi
+
+          if ! git -C pages diff --cached --quiet; then
+            git -C pages commit -m "Remove preview for PR #$PR_NUMBER"
+          fi
+
+          for attempt in 1 2 3; do
+            if git -C pages push origin HEAD:gh-pages; then
+              exit 0
+            fi
+
+            git -C pages fetch origin gh-pages
+            git -C pages rebase origin/gh-pages
+
+            CHANGED="$(git -C pages diff-tree --no-commit-id --name-only -r HEAD)"
+            if [ -n "$CHANGED" ] && grep -Ev "^pr-preview/$PR_NUMBER/" <<<"$CHANGED" >/dev/null; then
+              echo "Cleanup commit scope violation after rebase" >&2
+              exit 1
+            fi
+          done
+
+          exit 1
+
+      - name: Refresh cleaned archive
+        if: steps.trusted.outputs.mode == 'cleanup'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C pages fetch origin gh-pages
+          git -C pages reset --hard origin/gh-pages
+
+      - name: Upload cleaned site
+        if: steps.trusted.outputs.mode == 'cleanup'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          name: pr-preview-2-cleanup
+          path: pages
+          retention-days: 1
+
+      - name: Deploy cleaned site
+        if: steps.trusted.outputs.mode == 'cleanup'
+        id: deploy_cleanup
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+        with:
+          artifact_name: pr-preview-2-cleanup
